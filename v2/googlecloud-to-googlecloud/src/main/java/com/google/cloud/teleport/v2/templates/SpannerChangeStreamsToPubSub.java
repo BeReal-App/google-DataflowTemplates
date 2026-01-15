@@ -179,6 +179,7 @@ public class SpannerChangeStreamsToPubSub {
     }
     
     // Read change stream records and convert to byte[] using FileFormatFactory
+    // Note: We don't set the topic name to prevent direct write to Pub/Sub
     PCollection<byte[]> messageBytes =
         pipeline
             .apply(
@@ -192,12 +193,13 @@ public class SpannerChangeStreamsToPubSub {
                     .withRpcPriority(rpcPriority)
                     .withMetadataTable(metadataTableName))
             .apply(
-                "Convert each record to a PubsubMessage",
+                "Convert each record to byte[]",
                 FileFormatFactorySpannerChangeStreamsToPubSub.newBuilder()
                     .setOutputDataFormat(options.getOutputDataFormat())
                     .setProjectId(pubsubProjectId)
                     .setPubsubAPI(pubsubAPI)
-                    .setPubsubTopicName(pubsubTopicName)
+                    // Don't set topic name - this should make it just convert, not write directly
+                    // If this causes an error, we'll need a different approach
                     .setIncludeSpannerSource(includeSpannerSource)
                     .setSpannerDatabaseId(databaseId)
                     .setSpannerInstanceId(instanceId)
@@ -239,15 +241,16 @@ public class SpannerChangeStreamsToPubSub {
         String userId = extractUserIdFromJson(jsonObject);
         if (userId != null && !userId.isEmpty()) {
           orderingKey = userId;
+          LOG.debug("Extracted ordering key: {}", userId);
+        } else {
+          LOG.debug("No user ID found in message");
         }
       } catch (Exception e) {
-        LOG.debug("Could not extract user ID from message payload: {}", e.getMessage());
+        LOG.warn("Could not extract user ID from message payload: {}", e.getMessage());
         // Continue without ordering key - message will still be published
       }
       
       // Create a PubsubMessage with the ordering key set
-      // Note: PubsubMessage constructor signature may vary by Beam version
-      // This assumes: PubsubMessage(byte[] payload, Map<String, String> attributes, String messageId, String orderingKey)
       Map<String, String> attributes = new HashMap<>();
       PubsubMessage messageWithOrderingKey =
           new PubsubMessage(
@@ -255,6 +258,10 @@ public class SpannerChangeStreamsToPubSub {
               attributes,
               null,  // messageId - can be null, Pub/Sub will generate one
               orderingKey);
+      
+      if (orderingKey != null && !orderingKey.isEmpty()) {
+        LOG.info("Created PubsubMessage with ordering key: {}", orderingKey);
+      }
       
       c.output(messageWithOrderingKey);
     }
@@ -268,22 +275,27 @@ public class SpannerChangeStreamsToPubSub {
         String tableName = jsonObject.has("tableName") 
             ? jsonObject.get("tableName").getAsString() 
             : null;
+        LOG.debug("Checking tableName: {}", tableName);
         if ("Users".equals(tableName) && jsonObject.has("mods")) {
           JsonArray mods = jsonObject.get("mods").getAsJsonArray();
+          LOG.debug("Found {} mods", mods.size());
           if (mods.size() > 0) {
             JsonObject firstMod = mods.get(0).getAsJsonObject();
             if (firstMod.has("keysJson")) {
               String keysJson = firstMod.get("keysJson").getAsString();
+              LOG.debug("Parsing keysJson: {}", keysJson);
               JsonParser parser = new JsonParser();
               JsonObject keys = parser.parse(keysJson).getAsJsonObject();
               if (keys.has("UserId")) {
-                return keys.get("UserId").getAsString();
+                String userId = keys.get("UserId").getAsString();
+                LOG.debug("Extracted UserId: {}", userId);
+                return userId;
               }
             }
           }
         }
       } catch (Exception e) {
-        LOG.debug("Could not extract user ID from JSON: {}", e.getMessage());
+        LOG.warn("Could not extract user ID from JSON: {}", e.getMessage(), e);
       }
       return null;
     }
