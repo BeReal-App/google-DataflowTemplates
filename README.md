@@ -1,3 +1,29 @@
+#BeReal update
+
+Update `v2/googlecloud-to-googlecloud/src/main/java/com/google/cloud/teleport/v2/templates/SpannerChangeStreamsToPubSub.java` to support "order keys".
+
+To build the jar:
+
+```
+mvn clean package -pl v2/googlecloud-to-googlecloud -am -DskipTests
+```
+
+The jar should be available in the `v2/googlecloud-to-googlecloud/target` directory
+
+Build the template with:
+
+```
+gcloud dataflow flex-template build \
+  gs://dataflow-staging-us-central1-170342954565/staging/templates/spanner-changestreams-to-pubsub-with-ordering.json \
+  --image-gcr-path us-central1-docker.pkg.dev/backend-core-dev/dataflow-templates/spanner-changestreams-to-pubsub-with-ordering:latest \
+  --sdk-language JAVA \
+  --flex-template-base-image JAVA17 \
+  --jar v2/googlecloud-to-googlecloud/target/googlecloud-to-googlecloud-1.0-SNAPSHOT.jar \
+  --env FLEX_TEMPLATE_JAVA_MAIN_CLASS=com.google.cloud.teleport.v2.templates.SpannerChangeStreamsToPubSub \
+  --service-account-email search-dataflow-spanner-cs@backend-core-dev.iam.gserviceaccount.com
+```
+
+
 # Google Cloud Dataflow Template Pipelines
 
 These Dataflow templates are an effort to solve simple, but large, in-Cloud data

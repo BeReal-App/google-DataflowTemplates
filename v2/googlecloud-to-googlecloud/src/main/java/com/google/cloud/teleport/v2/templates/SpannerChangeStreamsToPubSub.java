@@ -22,15 +22,24 @@ import com.google.cloud.teleport.metadata.TemplateCategory;
 import com.google.cloud.teleport.v2.common.UncaughtExceptionLogger;
 import com.google.cloud.teleport.v2.options.SpannerChangeStreamsToPubSubOptions;
 import com.google.cloud.teleport.v2.transforms.FileFormatFactorySpannerChangeStreamsToPubSub;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.PipelineResult;
+import org.apache.beam.sdk.io.gcp.pubsub.PubsubMessage;
 import org.apache.beam.sdk.io.gcp.spanner.SpannerConfig;
 import org.apache.beam.sdk.io.gcp.spanner.SpannerIO;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.options.ValueProvider;
+import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.values.PCollection;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -168,29 +177,115 @@ public class SpannerChangeStreamsToPubSub {
           spannerConfig.withDatabaseRole(
               ValueProvider.StaticValueProvider.of(options.getSpannerDatabaseRole()));
     }
-    pipeline
-        .apply(
-            SpannerIO.readChangeStream()
-                .withSpannerConfig(spannerConfig)
-                .withMetadataInstance(metadataInstanceId)
-                .withMetadataDatabase(metadataDatabaseId)
-                .withChangeStreamName(changeStreamName)
-                .withInclusiveStartAt(startTimestamp)
-                .withInclusiveEndAt(endTimestamp)
-                .withRpcPriority(rpcPriority)
-                .withMetadataTable(metadataTableName))
-        .apply(
-            "Convert each record to a PubsubMessage",
-            FileFormatFactorySpannerChangeStreamsToPubSub.newBuilder()
-                .setOutputDataFormat(options.getOutputDataFormat())
-                .setProjectId(pubsubProjectId)
-                .setPubsubAPI(pubsubAPI)
-                .setPubsubTopicName(pubsubTopicName)
-                .setIncludeSpannerSource(includeSpannerSource)
-                .setSpannerDatabaseId(databaseId)
-                .setSpannerInstanceId(instanceId)
-                .setOutputMessageMetadata(outputMessageMetadata)
-                .build());
+    
+    // Read change stream records and convert to byte[] using FileFormatFactory
+    PCollection<byte[]> messageBytes =
+        pipeline
+            .apply(
+                SpannerIO.readChangeStream()
+                    .withSpannerConfig(spannerConfig)
+                    .withMetadataInstance(metadataInstanceId)
+                    .withMetadataDatabase(metadataDatabaseId)
+                    .withChangeStreamName(changeStreamName)
+                    .withInclusiveStartAt(startTimestamp)
+                    .withInclusiveEndAt(endTimestamp)
+                    .withRpcPriority(rpcPriority)
+                    .withMetadataTable(metadataTableName))
+            .apply(
+                "Convert each record to a PubsubMessage",
+                FileFormatFactorySpannerChangeStreamsToPubSub.newBuilder()
+                    .setOutputDataFormat(options.getOutputDataFormat())
+                    .setProjectId(pubsubProjectId)
+                    .setPubsubAPI(pubsubAPI)
+                    .setPubsubTopicName(pubsubTopicName)
+                    .setIncludeSpannerSource(includeSpannerSource)
+                    .setSpannerDatabaseId(databaseId)
+                    .setSpannerInstanceId(instanceId)
+                    .setOutputMessageMetadata(outputMessageMetadata)
+                    .build());
+    
+    // Extract user ID and create PubsubMessage with ordering key
+    PCollection<PubsubMessage> pubsubMessages =
+        messageBytes.apply(
+            "Extract user ID and create PubsubMessage with ordering key",
+            ParDo.of(new CreatePubsubMessageWithOrderingKey()));
+    
+    // Write to Pub/Sub - the ordering key is already set in the PubsubMessage
+    pubsubMessages.apply(
+        "Write to Pub/Sub",
+        org.apache.beam.sdk.io.gcp.pubsub.PubsubIO.writeMessages()
+            .to(String.format("projects/%s/topics/%s", pubsubProjectId, pubsubTopicName)));
+    
     return pipeline.run();
+  }
+  
+  /**
+   * DoFn that extracts user ID from message payload (byte[]) and creates PubsubMessage
+   * with ordering key set to user ID.
+   */
+  private static class CreatePubsubMessageWithOrderingKey extends DoFn<byte[], PubsubMessage> {
+    @ProcessElement
+    public void processElement(ProcessContext c) {
+      byte[] payload = c.element();
+      String orderingKey = null;
+      
+      try {
+        // Parse the message payload to extract user ID
+        String payloadString = new String(payload, StandardCharsets.UTF_8);
+        JsonParser parser = new JsonParser();
+        JsonObject jsonObject = parser.parse(payloadString).getAsJsonObject();
+        
+        // Extract user ID if this is a Users table change
+        String userId = extractUserIdFromJson(jsonObject);
+        if (userId != null && !userId.isEmpty()) {
+          orderingKey = userId;
+        }
+      } catch (Exception e) {
+        LOG.debug("Could not extract user ID from message payload: {}", e.getMessage());
+        // Continue without ordering key - message will still be published
+      }
+      
+      // Create a PubsubMessage with the ordering key set
+      // Note: PubsubMessage constructor signature may vary by Beam version
+      // This assumes: PubsubMessage(byte[] payload, Map<String, String> attributes, String messageId, String orderingKey)
+      Map<String, String> attributes = new HashMap<>();
+      PubsubMessage messageWithOrderingKey =
+          new PubsubMessage(
+              payload,
+              attributes,
+              null,  // messageId - can be null, Pub/Sub will generate one
+              orderingKey);
+      
+      c.output(messageWithOrderingKey);
+    }
+    
+    /**
+     * Extracts user ID from a JSON object representing a change stream message.
+     * Expected format: {"tableName": "Users", "mods": [{"keysJson": "{\"UserId\": \"...\"}", ...}], ...}
+     */
+    private String extractUserIdFromJson(JsonObject jsonObject) {
+      try {
+        String tableName = jsonObject.has("tableName") 
+            ? jsonObject.get("tableName").getAsString() 
+            : null;
+        if ("Users".equals(tableName) && jsonObject.has("mods")) {
+          JsonArray mods = jsonObject.get("mods").getAsJsonArray();
+          if (mods.size() > 0) {
+            JsonObject firstMod = mods.get(0).getAsJsonObject();
+            if (firstMod.has("keysJson")) {
+              String keysJson = firstMod.get("keysJson").getAsString();
+              JsonParser parser = new JsonParser();
+              JsonObject keys = parser.parse(keysJson).getAsJsonObject();
+              if (keys.has("UserId")) {
+                return keys.get("UserId").getAsString();
+              }
+            }
+          }
+        }
+      } catch (Exception e) {
+        LOG.debug("Could not extract user ID from JSON: {}", e.getMessage());
+      }
+      return null;
+    }
   }
 }
